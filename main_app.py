@@ -18,6 +18,7 @@ Ejecutar con:  streamlit run main_app.py
 from __future__ import annotations
 
 import html
+import io
 import re
 import time
 import zlib
@@ -43,6 +44,30 @@ try:
     GROQ_INSTALLED = True
 except ImportError:
     GROQ_INSTALLED = False
+
+try:
+    from PIL import Image
+
+    PILLOW_INSTALLED = True
+except ImportError:
+    PILLOW_INSTALLED = False
+
+# RapidOCR se publica bajo dos nombres de paquete con APIs de salida distintas:
+# rapidocr_onnxruntime (1.x) y rapidocr (2.x, unificado). Se detecta cual hay
+# disponible al importar y la diferencia se absorbe en normalize_ocr_result().
+RAPIDOCR_FLAVOR: str | None = None
+RAPIDOCR_IMPORT_ERROR: str = ""
+try:
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+
+    RAPIDOCR_FLAVOR = "rapidocr_onnxruntime"
+except Exception as _exc_v1:  # noqa: BLE001 - se reintenta con el otro paquete
+    try:
+        from rapidocr import RapidOCR  # type: ignore
+
+        RAPIDOCR_FLAVOR = "rapidocr"
+    except Exception as _exc_v2:  # noqa: BLE001
+        RAPIDOCR_IMPORT_ERROR = f"{type(_exc_v1).__name__}: {_exc_v1} / {type(_exc_v2).__name__}: {_exc_v2}"
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +132,19 @@ class Token:
     id: int     # ID en el vocabulario correspondiente
     start: int  # offset inicial en el texto original, en caracteres
     end: int
+
+
+@dataclass(frozen=True)
+class OcrLine:
+    """Una linea reconocida por el OCR.
+
+    Mismo criterio que con Token: una unica estructura de salida, aqui para
+    que el render y las metricas no tengan que ramificar segun la version de
+    RapidOCR que haya instalada.
+    """
+
+    text: str
+    score: float  # confianza del reconocimiento, entre 0 y 1
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1140,306 @@ def tab_generation(api_key: str, catalog: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# OCR
+# ---------------------------------------------------------------------------
+
+OCR_TEMPLATES: dict[str, str] = {
+    "Ampliar y explicar en detalle": (
+        "Amplia y explica en detalle el texto extraido de una imagen que aparece "
+        "mas abajo. Desarrolla los conceptos que menciona, aporta contexto y "
+        "ejemplos concretos, y senala cualquier punto que quede ambiguo o "
+        "incompleto en el original."
+    ),
+    "Resumir": (
+        "Resume el texto extraido de una imagen que aparece mas abajo. Quedate "
+        "con las ideas principales y presentalas en una lista breve."
+    ),
+    "Corregir ortografia y formato": (
+        "Corrige la ortografia, la puntuacion y el formato del texto extraido de "
+        "una imagen que aparece mas abajo. Ten en cuenta que procede de un OCR y "
+        "puede contener errores de reconocimiento: reconstruye las palabras "
+        "dudosas segun el contexto. Devuelve solo el texto corregido."
+    ),
+    "Traducir al ingles": (
+        "Traduce al ingles el texto extraido de una imagen que aparece mas abajo, "
+        "conservando su formato y su tono."
+    ),
+    "Instruccion propia": "",
+}
+
+
+@st.cache_resource(show_spinner=False)
+def load_ocr_engine():
+    """Instancia el motor de OCR.
+
+    Va en cache_resource porque carga modelos ONNX en memoria: es un recurso
+    vivo y no serializable, al contrario que el resultado del reconocimiento.
+    """
+    return RapidOCR()
+
+
+def normalize_ocr_result(raw) -> list[OcrLine]:
+    """Absorbe las dos formas de salida de RapidOCR.
+
+    La version 2.x devuelve un objeto con .txts y .scores; la 1.x devuelve la
+    tupla (lista de [caja, texto, score], tiempos). Normalizar aqui evita que
+    la diferencia se propague al resto de la pestana.
+    """
+    if raw is None:
+        return []
+
+    if hasattr(raw, "txts"):  # rapidocr 2.x
+        txts = list(raw.txts or [])
+        scores = list(raw.scores or [])
+        if not scores:
+            scores = [1.0] * len(txts)
+        return [OcrLine(str(t), float(s)) for t, s in zip(txts, scores)]
+
+    # rapidocr_onnxruntime 1.x
+    result = raw[0] if isinstance(raw, tuple) else raw
+    if not result:
+        return []
+
+    lineas: list[OcrLine] = []
+    for item in result:
+        if len(item) >= 3:      # [caja, texto, score]
+            lineas.append(OcrLine(str(item[1]), float(item[2])))
+        elif len(item) == 2:    # [texto, score]
+            lineas.append(OcrLine(str(item[0]), float(item[1])))
+    return lineas
+
+
+@st.cache_data(show_spinner=False)
+def run_ocr_cached(image_bytes: bytes) -> tuple[list[dict], float]:
+    """Ejecuta el OCR cacheando por CONTENIDO del archivo, no por nombre.
+
+    Aqui el cacheo no es una optimizacion sino parte del diseno: el usuario va
+    a iterar sobre la misma imagen probando plantillas de prompt distintas, y
+    sin esto cada clic repetiria la inferencia ONNX entera. Devuelve dicts
+    porque cache_data serializa su resultado.
+    """
+    engine = load_ocr_engine()
+    imagen = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    arreglo = np.array(imagen)
+
+    inicio = time.perf_counter()
+    raw = engine(arreglo)
+    transcurrido = time.perf_counter() - inicio
+
+    lineas = normalize_ocr_result(raw)
+    return [{"text": ln.text, "score": ln.score} for ln in lineas], transcurrido
+
+
+def render_ocr_lines_html(lineas: list[dict]) -> str:
+    """Pinta cada linea con el color de su confianza.
+
+    Reutiliza heat_color(), el mismo degradado del heatmap de coseno: azul
+    oscuro es confianza alta, casi blanco es confianza baja. Asi se localiza
+    de un vistazo donde el OCR ha dudado.
+    """
+    filas = []
+    for i, linea in enumerate(lineas):
+        score = float(linea["score"])
+        bg, fg = heat_color(score)
+        filas.append(
+            f"<div style='background:{bg};color:{fg};padding:5px 9px;margin:3px 0;"
+            "border-radius:4px;display:flex;justify-content:space-between;gap:12px'>"
+            f"<span style='font-family:ui-monospace,Menlo,Consolas,monospace;"
+            f"font-size:.88em'>{html.escape(linea['text'])}</span>"
+            f"<span style='opacity:.8;font-size:.78em;white-space:nowrap'>"
+            f"#{i + 1} &middot; {score:.2f}</span></div>"
+        )
+    return "<div>" + "".join(filas) + "</div>"
+
+
+def build_ocr_prompt(instruccion: str, texto: str) -> str:
+    """Compone instruccion + material con delimitadores explicitos.
+
+    Los delimitadores importan: sin ellos el modelo no puede distinguir donde
+    acaba tu encargo y donde empieza el texto de la imagen, y un documento que
+    contenga algo parecido a una orden puede acabar interpretandose como tal.
+    """
+    return (
+        f"{instruccion.strip()}\n\n"
+        "--- TEXTO EXTRAIDO POR OCR ---\n"
+        f"{texto.strip()}\n"
+        "--- FIN DEL TEXTO EXTRAIDO ---"
+    )
+
+
+def tab_ocr(api_key: str, catalog: list[dict]) -> None:
+    st.subheader("OCR: de la imagen al prompt")
+    st.caption(
+        "El reconocimiento corre en local con RapidOCR (PP-OCR sobre ONNX): no "
+        "consume cuota de Groq ni necesita red. Solo la ampliacion de la "
+        "respuesta llama al modelo."
+    )
+
+    if not PILLOW_INSTALLED:
+        st.error(
+            "Falta Pillow para decodificar imagenes. Instala las dependencias con "
+            "pip install -r requirements.txt"
+        )
+        return
+
+    if RAPIDOCR_FLAVOR is None:
+        st.error(
+            "El motor de OCR no esta disponible. Instalalo con "
+            "pip install rapidocr-onnxruntime onnxruntime"
+        )
+        if RAPIDOCR_IMPORT_ERROR:
+            with st.expander("Detalle del error de importacion"):
+                st.code(RAPIDOCR_IMPORT_ERROR)
+        st.caption("El resto de pestanas sigue funcionando con normalidad.")
+        return
+
+    st.caption(f"Motor detectado: {RAPIDOCR_FLAVOR}")
+
+    archivo = st.file_uploader(
+        "Imagen con texto",
+        type=["png", "jpg", "jpeg", "bmp", "webp"],
+        key="ocr_file",
+    )
+    if archivo is None:
+        st.info("Sube una imagen para extraer su texto.")
+        return
+
+    datos = archivo.getvalue()
+
+    col_img, col_res = st.columns([1, 1])
+    with col_img:
+        st.image(datos, caption=archivo.name, use_container_width=True)
+
+    with col_res:
+        try:
+            with st.spinner("Reconociendo texto..."):
+                lineas, transcurrido = run_ocr_cached(datos)
+        except Exception as exc:
+            st.error(f"El OCR fallo. {error_text(exc)}")
+            return
+
+        if not lineas:
+            st.warning(
+                "No se reconocio ningun texto. Prueba con una imagen de mayor "
+                "resolucion o con mas contraste entre el texto y el fondo."
+            )
+            return
+
+        texto_extraido = "\n".join(ln["text"] for ln in lineas)
+        confianzas = [float(ln["score"]) for ln in lineas]
+
+        m1, m2 = st.columns(2)
+        m3, m4 = st.columns(2)
+        m1.metric("Lineas detectadas", len(lineas))
+        m2.metric("Caracteres", len(texto_extraido))
+        m3.metric("Confianza media", f"{sum(confianzas) / len(confianzas):.3f}")
+        m4.metric("Tiempo de OCR", f"{transcurrido:.2f} s")
+
+        st.markdown(render_ocr_lines_html(lineas), unsafe_allow_html=True)
+        st.caption(
+            "Cuanto mas claro es el fondo de una linea, menos seguro estuvo el "
+            "motor de su lectura. Son las candidatas a revisar antes de enviar."
+        )
+
+    # El area de texto conserva su valor entre ejecuciones por tener key propia.
+    # Al cambiar de imagen hay que refrescarla a mano, y la asignacion se hace
+    # ANTES de instanciar el widget: modificar la clave de un widget ya creado
+    # en la misma pasada lanzaria una excepcion de Streamlit.
+    huella = zlib.crc32(datos)
+    if st.session_state.get("ocr_digest") != huella:
+        st.session_state["ocr_digest"] = huella
+        st.session_state["ocr_text"] = texto_extraido
+
+    st.markdown("**Texto extraido (editable)**")
+    st.caption(
+        "El OCR se equivoca. Corrige aqui lo que haga falta antes de enviarlo: "
+        "es este texto, y no la transcripcion cruda, el que va al modelo."
+    )
+    texto_editado = st.text_area(
+        "Texto extraido", height=200, key="ocr_text", label_visibility="collapsed"
+    )
+
+    st.divider()
+    st.markdown("**Ampliar la respuesta con un modelo de Groq**")
+
+    plantilla = st.selectbox("Que hacer con el texto", list(OCR_TEMPLATES.keys()), index=0)
+    if plantilla == "Instruccion propia":
+        instruccion = st.text_area(
+            "Tu instruccion",
+            value="Explica el texto anterior como si fuera para un estudiante de primer curso.",
+            height=90,
+            key="ocr_custom_instruction",
+        )
+    else:
+        instruccion = OCR_TEMPLATES[plantilla]
+        st.caption(instruccion)
+
+    prompt_final = build_ocr_prompt(instruccion, texto_editado)
+    with st.expander("Prompt exacto que se enviara"):
+        st.code(prompt_final, language="text")
+        st.caption(
+            "Ver el prompt ensamblado es parte del ejercicio: la instruccion y el "
+            "material van separados por delimitadores para que el modelo no "
+            "confunda uno con otro."
+        )
+
+    model_ids = [row["id"] for row in catalog]
+    if not model_ids:
+        st.warning("El catalogo de modelos vino vacio; no se puede generar.")
+        return
+
+    idx, aviso = default_model_index(model_ids)
+    if aviso:
+        st.info(aviso)
+
+    col_m, col_t, col_k = st.columns([2, 1, 1])
+    model = col_m.selectbox("Modelo", model_ids, index=idx, key="ocr_model")
+    temperature = col_t.slider("temperature", 0.0, 2.0, 0.6, 0.05, key="ocr_temp")
+
+    info = next((row for row in catalog if row["id"] == model), {})
+    techo = max(int(info.get("max_completion_tokens") or 4096), 32)
+    max_tokens = col_k.slider(
+        "max_completion_tokens", 64, techo, min(1024, techo), 64, key="ocr_max_tokens"
+    )
+
+    if st.button("Ampliar la respuesta", type="primary", key="ocr_generate"):
+        if not texto_editado.strip():
+            st.error("No hay texto que enviar.")
+            return
+        if plantilla == "Instruccion propia" and not instruccion.strip():
+            st.error("Escribe una instruccion.")
+            return
+
+        params = build_params(
+            model,
+            "Eres un asistente que trabaja sobre texto extraido por OCR y responde en espanol.",
+            prompt_final,
+            temperature,
+            1.0,
+            max_tokens,
+            0.0,
+            0.0,
+            None,
+            "medium",
+        )
+        sink: dict = {}
+        inicio = time.perf_counter()
+        try:
+            st.write_stream(stream_completion(get_client(api_key), params, sink))
+        except Exception as exc:
+            st.error(f"La generacion fallo. {error_text(exc)}")
+            return
+        elapsed = time.perf_counter() - inicio
+
+        uso = usage_row(sink.get("usage"))
+        cols = st.columns(4)
+        cols[0].metric("Latencia", f"{elapsed:.2f} s")
+        cols[1].metric("Tokens de prompt", uso.get("prompt_tokens", "n/d"))
+        cols[2].metric("Tokens generados", uso.get("completion_tokens", "n/d"))
+        cols[3].metric("Tokens totales", uso.get("total_tokens", "n/d"))
+
+
+# ---------------------------------------------------------------------------
 # Aplicacion
 # ---------------------------------------------------------------------------
 
@@ -1159,6 +1497,7 @@ def main() -> None:
             "Similitud de coseno",
             "Tokens reales (Groq)",
             "Generacion (Groq)",
+            "OCR",
         ]
     )
 
@@ -1172,6 +1511,8 @@ def main() -> None:
         tab_real_tokens(api_key, catalog, corpus)
     with tabs[4]:
         tab_generation(api_key, catalog)
+    with tabs[5]:
+        tab_ocr(api_key, catalog)
 
 
 if __name__ == "__main__":

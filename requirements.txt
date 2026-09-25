@@ -1,9 +1,18 @@
 # Laboratorio de PLN y LLMs - dependencias
 # Minimos elegidos para garantizar wheels precompiladas en Python 3.13.
 
-streamlit>=1.40
+# 1.41 es la primera version con use_container_width en st.image (antes era
+# use_column_width), que usa la vista previa de la pestana de OCR.
+streamlit>=1.41
 tiktoken>=0.9
 scikit-learn>=1.6
 pandas>=2.2
 numpy>=2.1
 groq>=0.11
+
+# OCR local (no consume cuota de Groq). onnxruntime se fija explicito porque
+# RapidOCR permite versiones mucho mas antiguas y 1.20 es la primera con
+# wheels para cp313; opencv, pyclipper y shapely entran transitivamente.
+rapidocr-onnxruntime>=1.4
+onnxruntime>=1.20
+Pillow>=10.4
