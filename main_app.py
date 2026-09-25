@@ -1283,10 +1283,33 @@ def tab_ocr(api_key: str, catalog: list[dict]) -> None:
         return
 
     if RAPIDOCR_FLAVOR is None:
-        st.error(
-            "El motor de OCR no esta disponible. Instalalo con "
-            "pip install rapidocr-onnxruntime onnxruntime"
+        # Distinguir "no esta instalado" de "esta instalado pero le falta una
+        # libreria del sistema" importa: son fallos con arreglos opuestos, y el
+        # segundo es el tipico de OpenCV en Linux headless, donde pip no ayuda.
+        falta_libreria_sistema = any(
+            marca in RAPIDOCR_IMPORT_ERROR
+            for marca in ("libGL", "libgthread", "libglib", "libSM", "libXext")
         )
+        if falta_libreria_sistema:
+            st.error(
+                "El motor de OCR esta instalado, pero OpenCV no encuentra una "
+                "libreria del sistema. Es el fallo tipico de OpenCV en Linux sin "
+                "entorno grafico, y no se arregla con pip."
+            )
+            st.markdown(
+                "- **Streamlit Community Cloud u otro despliegue desde GitHub:** "
+                "el repositorio incluye un `packages.txt` con `libgl1` y "
+                "`libglib2.0-0`. Confirma que esta subido y vuelve a desplegar.\n"
+                "- **Docker, WSL o Linux local:** "
+                "`sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0`\n"
+                "- **Sin permisos de root:** "
+                "`pip uninstall -y opencv-python && pip install opencv-python-headless`"
+            )
+        else:
+            st.error(
+                "El motor de OCR no esta instalado. Instalalo con "
+                "pip install rapidocr-onnxruntime onnxruntime"
+            )
         if RAPIDOCR_IMPORT_ERROR:
             with st.expander("Detalle del error de importacion"):
                 st.code(RAPIDOCR_IMPORT_ERROR)
