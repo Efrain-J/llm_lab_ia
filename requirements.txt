@@ -1,0 +1,9 @@
+# Laboratorio de PLN y LLMs - dependencias
+# Minimos elegidos para garantizar wheels precompiladas en Python 3.13.
+
+streamlit>=1.40
+tiktoken>=0.9
+scikit-learn>=1.6
+pandas>=2.2
+numpy>=2.1
+groq>=0.11
